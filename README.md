@@ -82,12 +82,6 @@ Prints the actual remap percentages for naive `% N` hashing vs. consistent hashi
 python3 -m pytest tests/test_rate_limiter.py -v -s
 ```
 
-## Things I'd extend if this weren't a 5-day project
-
-- Redis Cluster (actual sharded Redis, not single instance) — the consistent hash ring would then really route to different Redis nodes, not just annotate a header
-- Raft-based leader election instead of a single load balancer instance (currently the LB itself is a single point of failure)
-- Circuit breaker on the LB→gateway path, not just passive health checks
-- Real backend business logic instead of `simulate_backend_work`
 
 ## Another real bug: startup race condition across instances
 
@@ -173,7 +167,7 @@ target `http://gateway-1:8000` directly via Docker's internal DNS. This
 isolates true request-handling throughput from the host networking
 limitation.
 
-## A real bug we found under load testing (good interview material)
+## A real bug we found under load testing
 
 Initial load test (1000 requests, 100 concurrent) showed throughput of only
 **20 req/s** and p50 latency of **4.7 seconds** — wildly worse than the
