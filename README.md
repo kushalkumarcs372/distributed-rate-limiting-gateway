@@ -112,6 +112,34 @@ racing on schema migration at deploy time) and a legitimate thing to
 mention in an interview — the fix pattern (DB-backed lock for
 one-time-setup coordination) generalizes well beyond this specific case.
 
+**Final confirmed measurement** (run from inside the Docker network,
+bypassing Windows port-forwarding, after fixing both the blocking-I/O bug
+and the startup race condition below):
+
+```
+1000 requests, 100 concurrent
+Throughput:    101.8 req/s
+Latency p50:   872.7ms
+Latency p95:   1261.7ms
+Latency max:   2320.4ms
+Status codes:  {200: 503, 429: 497}
+```
+
+The 503/497 split on status codes is *expected, correct behavior* — 50
+simulated clients × 20 requests each, rate limit = 10/client, so exactly
+half get allowed and half get legitimately rate-limited. It is not an
+error rate.
+
+**Note on methodology:** an earlier diagnostic in this same run showed
+"410 req/s direct to gateway-1" — that number is invalid and should be
+ignored. It came from a test hitting `localhost:8001` from *inside* the
+`loadbalancer` container, where port 8001 isn't reachable at all; the
+requests failed instantly and a bug in the test script's exception
+handling recorded those failures as fast successes. Caught by checking
+"why is this suspiciously faster than everything else" rather than
+trusting a good-looking number — worth mentioning as a debugging habit,
+not hiding.
+
 ## Diagnosing environment vs. app bottlenecks (real debugging story)
 
 Initial load tests from Windows via `localhost:8080` showed throughput
