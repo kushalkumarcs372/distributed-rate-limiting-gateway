@@ -125,40 +125,7 @@ Prints the actual remap percentages for naive `% N` hashing vs. consistent hashi
 ```bash
 python3 -m pytest tests/test_rate_limiter.py -v -s
 ```
-
-## Extensions completed after the initial 5-day build
-
-Originally listed as future work, then actually implemented:
-
-- ✅ **Real Redis sharding** — 3 independent Redis instances, client-side
-  sharded via the consistent hash ring (`gateway/redis_shard_router.py`).
-  The ring's routing decision now genuinely determines which physical
-  Redis instance holds a client's data.
-- ✅ **Circuit breaker** on the load-balancer→gateway path
-  (`loadbalancer/lb.py`) — CLOSED → OPEN → HALF_OPEN, reacting to live
-  request failures immediately instead of waiting on the 3-second passive
-  health check poll. Verified with unit tests (`tests/test_circuit_breaker.py`).
-- ✅ **Real backend business logic** — order placement against limited
-  inventory with row-level locking (`gateway/orders.py`), replacing the
-  earlier `simulate_backend_work` placeholder.
-
-### Deliberately NOT implemented: Raft-based leader election for the load balancer
-
-The load balancer is still a single instance (a real single point of
-failure). The "fix" would typically be Raft-based leader election across
-multiple LB instances. This was deliberately left out rather than rushed:
-a correct Raft implementation (election safety, log matching, leader
-completeness) is a substantial distributed-systems project on its own —
-easy to describe, notoriously easy to get subtly wrong (this is *why*
-the Raft paper exists — the previous standard, Paxos, was widely
-considered too hard to implement correctly). Shipping a rushed, likely-
-incorrect Raft implementation and calling it "consensus" would be a
-worse outcome than clearly stating the gap: in a real production setup,
-you'd put 2+ LB instances behind a cloud load balancer, DNS-based
-failover, or a coordination service like etcd/Consul (which already
-implements Raft correctly) rather than hand-rolling it.
-
-## Another real bug: startup race condition across instances
+## startup race condition across instances
 
 When all 3 gateway containers start simultaneously, each independently
 runs `CREATE TABLE IF NOT EXISTS idempotency_keys` against Postgres at
@@ -209,7 +176,7 @@ handling recorded those failures as fast successes. Caught by checking
 trusting a good-looking number — worth mentioning as a debugging habit,
 not hiding.
 
-## Diagnosing environment vs. app bottlenecks (real debugging story)
+## Diagnosing environment vs. app bottlenecks (Debugging)
 
 Initial load tests from Windows via `localhost:8080` showed throughput
 stuck around 20-48 req/s regardless of which fix was applied. Systematic
@@ -242,7 +209,7 @@ target `http://gateway-1:8000` directly via Docker's internal DNS. This
 isolates true request-handling throughput from the host networking
 limitation.
 
-## A real bug we found under load testing (good interview material)
+## A real bug we found under load testing
 
 Initial load test (1000 requests, 100 concurrent) showed throughput of only
 **20 req/s** and p50 latency of **4.7 seconds** — wildly worse than the
@@ -271,8 +238,7 @@ This is worth stating explicitly in an interview: it demonstrates you can
 diagnose a real concurrency bug from load-test numbers, not just recite
 "use async" as a slogan.
 
-## Known limitations (be ready to say these out loud — it's more credible than pretending it's perfect)
-
+## Known limitations 
 - Load balancer is itself not distributed/HA (single instance) — see the Raft discussion above for why this is a deliberate, explained gap rather than a rushed fix
 - Sliding-window-counter is an *approximation*, not exact — under adversarial traffic patterns it can be off by a bounded amount (this is a known, accepted tradeoff, not a bug)
 - Redis sharding here is client-side (our own hash ring picking which of 3 independent instances to use), not the real Redis Cluster protocol — no automatic replication or failover between shards if one goes down
