@@ -31,7 +31,7 @@ async def one_request(client: httpx.AsyncClient, client_id: str, use_idempotency
 
     start = time.perf_counter()
     try:
-        resp = await client.post(f"{LB_URL}/api/action", headers=headers, timeout=10.0)
+        resp = await client.post(f"{LB_URL}/api/orders", headers=headers, timeout=10.0)
         elapsed = time.perf_counter() - start
         return elapsed, resp.status_code
     except Exception:
@@ -81,7 +81,7 @@ async def demo_rate_limit_blocking():
         allowed, blocked = 0, 0
         for _ in range(15):
             resp = await client.post(
-                f"{LB_URL}/api/action",
+                f"{LB_URL}/api/orders",
                 headers={"X-Client-Id": "rate-limit-demo-client"},
             )
             if resp.status_code == 429:
@@ -97,11 +97,11 @@ async def demo_idempotency():
     key = str(uuid.uuid4())
     async with httpx.AsyncClient() as client:
         r1 = await client.post(
-            f"{LB_URL}/api/action",
+            f"{LB_URL}/api/orders",
             headers={"X-Client-Id": "idempotency-demo-client", "Idempotency-Key": key},
         )
         r2 = await client.post(
-            f"{LB_URL}/api/action",
+            f"{LB_URL}/api/orders",
             headers={"X-Client-Id": "idempotency-demo-client", "Idempotency-Key": key},
         )
         print(f"first call:  {r1.status_code} {r1.json()}")
@@ -112,9 +112,9 @@ async def control_test_health_endpoint():
     """
     Diagnostic: hammer the trivial /health endpoint (no Redis, no Postgres,
     no business logic -- just returns a static dict) through the SAME load
-    balancer + network path as /api/action. If THIS is also slow, the
+    balancer + network path as /api/orders. If THIS is also slow, the
     bottleneck is network/Docker/proxy overhead, not our rate-limiter or
-    idempotency code. If this is fast but /api/action is slow, the
+    idempotency code. If this is fast but /api/orders is slow, the
     bottleneck really is in the app logic.
     """
     print("\n--- Control test: /health endpoint (no Redis/Postgres involved) ---")

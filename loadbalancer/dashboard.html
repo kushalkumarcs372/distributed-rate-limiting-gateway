@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Distributed API Gateway — Live Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text); padding: 24px;
+  }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+
+  .layout { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 14px 0; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+
+  /* Flow diagram */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .arrow { color: var(--muted); font-size: 20px; }
+  .box {
+    border: 2px solid var(--border); border-radius: 6px; padding: 10px 14px;
+    min-width: 110px; text-align: center; font-size: 12px; background: #0d1117;
+    transition: all .35s ease; position: relative;
+  }
+  .box .label { font-weight: 600; margin-bottom: 4px; }
+  .box .meta { color: var(--muted); font-size: 10px; }
+  .box.active { border-color: var(--blue); box-shadow: 0 0 14px rgba(88,166,255,.6); background: #0d2338; }
+  .box.state-closed { border-left: 4px solid var(--green); }
+  .box.state-open { border-left: 4px solid var(--red); }
+  .box.state-half_open { border-left: 4px solid var(--yellow); }
+  .box.unhealthy { opacity: .45; }
+
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .dot.green { background: var(--green); }
+  .dot.yellow { background: var(--yellow); }
+  .dot.red { background: var(--red); }
+
+  /* Controls */
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, select {
+    width: 100%; padding: 7px 8px; background: #0d1117; border: 1px solid var(--border);
+    border-radius: 5px; color: var(--text); font-size: 13px;
+  }
+  button {
+    margin-top: 14px; width: 100%; padding: 9px; border: none; border-radius: 6px;
+    background: var(--blue); color: #0d1117; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  button:hover { opacity: .9; }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); margin-top: 8px; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+  .checkbox-row input { width: auto; }
+
+  pre {
+    background: #0d1117; border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; font-size: 11px; max-height: 220px; overflow: auto; margin-top: 10px;
+  }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(63,185,80,.15); color: var(--green); }
+  .badge.warn { background: rgba(210,153,34,.15); color: var(--yellow); }
+  .badge.err { background: rgba(248,81,73,.15); color: var(--red); }
+
+  .inv-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 8px; }
+  .inv-bar-bg { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; height: 8px; margin-top: 4px; overflow: hidden; }
+  .inv-bar-fill { height: 100%; background: var(--blue); transition: width .4s ease; }
+</style>
+</head>
+<body>
+
+<h1>Distributed API Gateway — Live Dashboard</h1>
+<div class="subtitle">Consistent hashing · sliding-window rate limiting · idempotent orders · circuit breaker</div>
+
+<div class="layout">
+
+  <div class="panel">
+    <h2>Request Flow</h2>
+    <div class="flow">
+      <div class="box" id="box-client"><div class="label">Client</div></div>
+      <div class="arrow">↓</div>
+      <div class="box" id="box-lb"><div class="label">Load Balancer</div><div class="meta">:8080 · least-conn</div></div>
+      <div class="arrow">↓</div>
+      <div class="row">
+        <div class="box" id="box-gateway-1"><div class="label">gateway-1</div><div class="meta" id="meta-gateway-1">—</div></div>
+        <div class="box" id="box-gateway-2"><div class="label">gateway-2</div><div class="meta" id="meta-gateway-2">—</div></div>
+        <div class="box" id="box-gateway-3"><div class="label">gateway-3</div><div class="meta" id="meta-gateway-3">—</div></div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="row">
+        <div class="box" id="box-redis-shard-1"><div class="label">redis-shard-1</div></div>
+        <div class="box" id="box-redis-shard-2"><div class="label">redis-shard-2</div></div>
+        <div class="box" id="box-redis-shard-3"><div class="label">redis-shard-3</div></div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="box" id="box-postgres"><div class="label">Postgres</div><div class="meta">idempotency + orders</div></div>
+      <div class="arrow">↓</div>
+      <div class="box" id="box-result"><div class="label">Result</div><div class="meta" id="result-meta">waiting...</div></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Send a Request</h2>
+      <label>Client ID</label>
+      <input id="clientId" value="alice">
+
+      <label>Product</label>
+      <select id="product">
+        <option value="widget-a">widget-a</option>
+        <option value="widget-b">widget-b</option>
+        <option value="widget-c">widget-c</option>
+      </select>
+
+      <label>Quantity</label>
+      <input id="quantity" type="number" value="1" min="1">
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="useIdempotency" checked>
+        <label style="margin:0;">Send Idempotency-Key</label>
+      </div>
+
+      <button onclick="placeOrder()">Place Order</button>
+      <button class="secondary" onclick="rapidFire()">Send 15 rapid (rate-limit demo)</button>
+      <button class="secondary" onclick="replayLast()">Replay last Idempotency-Key</button>
+
+      <pre id="responseBox">// response will appear here</pre>
+    </div>
+
+    <div class="panel" style="margin-top: 16px;">
+      <h2>Inventory</h2>
+      <div id="inventoryBox">loading...</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let lastIdempotencyKey = null;
+
+function uuid() {
+  return crypto.randomUUID ? crypto.randomUUID() :
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random()*16|0, v = c=='x'?r:(r&0x3|0x8); return v.toString(16);
+    });
+}
+
+function flash(id, ms=1400) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.add('active');
+  setTimeout(() => el.classList.remove('active'), ms);
+}
+
+async function placeOrder(silent=false) {
+  const clientId = document.getElementById('clientId').value || 'anon';
+  const product = document.getElementById('product').value;
+  const quantity = parseInt(document.getElementById('quantity').value || '1');
+  const useKey = document.getElementById('useIdempotency').checked;
+
+  const key = useKey ? (lastIdempotencyKey || uuid()) : null;
+  if (useKey) lastIdempotencyKey = key;
+
+  flash('box-client'); flash('box-lb');
+
+  const headers = { 'X-Client-Id': clientId, 'Content-Type': 'application/json' };
+  if (key) headers['Idempotency-Key'] = key;
+
+  let resp, body, err = null;
+  try {
+    resp = await fetch('/api/orders', {
+      method: 'POST', headers,
+      body: JSON.stringify({ product_id: product, quantity })
+    });
+    body = await resp.json();
+  } catch (e) {
+    err = e;
+  }
+
+  if (err) {
+    document.getElementById('responseBox').textContent = 'Request failed: ' + err;
+    return;
+  }
+
+  const handledBy = resp.headers.get('X-Handled-By');
+  const shard = resp.headers.get('X-Redis-Shard');
+  const remaining = resp.headers.get('X-RateLimit-Remaining');
+
+  if (handledBy) setTimeout(() => flash('box-' + handledBy), 150);
+  if (shard) setTimeout(() => flash('box-' + shard), 500);
+  setTimeout(() => flash('box-postgres'), 850);
+
+  setTimeout(() => {
+    const resultBox = document.getElementById('box-result');
+    const resultMeta = document.getElementById('result-meta');
+    resultBox.classList.remove('active');
+    let badgeClass = 'ok', label = resp.status;
+    if (resp.status === 429) { badgeClass = 'warn'; label = '429 rate limited'; }
+    else if (resp.status === 409) { badgeClass = 'err'; label = '409 ' + (body.reason || 'conflict'); }
+    else if (resp.status >= 500) { badgeClass = 'err'; label = resp.status + ' error'; }
+    else { label = '200 ' + body.status; }
+    resultMeta.innerHTML = `<span class="badge ${badgeClass}">${label}</span>`;
+    flash('box-result');
+  }, 1200);
+
+  if (!silent) {
+    document.getElementById('responseBox').textContent =
+      `status: ${resp.status}\nhandled_by: ${handledBy}\nredis_shard: ${shard}\nrate_limit_remaining: ${remaining}\n\n` +
+      JSON.stringify(body, null, 2);
+  }
+  return { resp, body };
+}
+
+async function rapidFire() {
+  document.getElementById('responseBox').textContent = 'Sending 15 rapid requests...';
+  let allowed = 0, blocked = 0;
+  for (let i = 0; i < 15; i++) {
+    document.getElementById('useIdempotency').checked = false;
+    const { resp } = await placeOrder(true);
+    if (resp.status === 429) blocked++; else allowed++;
+  }
+  document.getElementById('useIdempotency').checked = true;
+  document.getElementById('responseBox').textContent =
+    `Rate limit demo complete.\nallowed: ${allowed}\nblocked_with_429: ${blocked}`;
+}
+
+async function replayLast() {
+  if (!lastIdempotencyKey) {
+    document.getElementById('responseBox').textContent = 'No idempotency key sent yet — place an order first.';
+    return;
+  }
+  await placeOrder();
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch('/lb/status');
+    const data = await resp.json();
+    for (const [url, info] of Object.entries(data)) {
+      const name = url.replace('http://', '').split(':')[0];
+      const box = document.getElementById('box-' + name);
+      const meta = document.getElementById('meta-' + name);
+      if (!box) continue;
+      box.classList.remove('state-closed', 'state-open', 'state-half_open', 'unhealthy');
+      box.classList.add('state-' + info.circuit_state.toLowerCase());
+      if (!info.healthy) box.classList.add('unhealthy');
+      const dotColor = !info.healthy ? 'red' : info.circuit_state === 'OPEN' ? 'red' : info.circuit_state === 'HALF_OPEN' ? 'yellow' : 'green';
+      if (meta) meta.innerHTML = `<span class="dot ${dotColor}"></span>${info.circuit_state} · ${info.active_connections} active · ${info.failed_requests}/${info.total_requests} failed`;
+    }
+  } catch (e) { /* LB might be mid-restart, ignore */ }
+}
+
+async function pollInventory() {
+  try {
+    const resp = await fetch('/api/inventory');
+    const data = await resp.json();
+    const box = document.getElementById('inventoryBox');
+    box.innerHTML = '';
+    const maxStock = 500;
+    for (const [product, stock] of Object.entries(data.inventory)) {
+      const pct = Math.max(0, Math.min(100, (stock / maxStock) * 100));
+      box.innerHTML += `
+        <div class="inv-row"><span>${product}</span><span>${stock} in stock</span></div>
+        <div class="inv-bar-bg"><div class="inv-bar-fill" style="width:${pct}%"></div></div>
+      `;
+    }
+  } catch (e) { /* ignore */ }
+}
+
+setInterval(pollStatus, 2000);
+setInterval(pollInventory, 3000);
+pollStatus();
+pollInventory();
+</script>
+
+</body>
+</html>

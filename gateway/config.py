@@ -1,6 +1,14 @@
 import os
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+# REDIS SHARDING: instead of one shared Redis instance, we run 3 independent
+# Redis instances and use our consistent hash ring to decide which shard
+# owns which client's rate-limit data. This is "client-side sharding" --
+# a real, widely-used pattern (this is what companies did before Redis
+# Cluster existed, and what proxies like Twemproxy still do). We deliberately
+# did NOT implement the real Redis Cluster protocol (hash slots, gossip,
+# cluster redirects) -- that's a much bigger correctness undertaking, and
+# getting it subtly wrong is worse than not claiming it at all.
+REDIS_SHARDS = os.getenv("REDIS_SHARDS", "redis-shard-1,redis-shard-2,redis-shard-3").split(",")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 POSTGRES_DSN = os.getenv(

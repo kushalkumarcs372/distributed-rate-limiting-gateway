@@ -2,19 +2,16 @@
 API Gateway
 -----------
 Every incoming request goes through, in order:
-  1. Consistent-hash routing check (which shard "owns" this client -- in a
-     real multi-shard-Redis setup this decides which Redis instance to hit;
-     here it's surfaced in the response so you can demo/explain it)
-  2. Rate limiting (Redis sliding window)
+  1. Consistent-hash routing: which Redis SHARD actually owns this client's
+     rate-limit state (this is now a real routing decision, not decorative --
+     see redis_shard_router.py)
+  2. Rate limiting against that shard's Redis instance (sliding window)
   3. Idempotency check (Postgres) -- only for POST/PUT/PATCH (mutating ops)
-  4. Forward to "backend" (mocked here as a simulated processing function)
+  4. Forward to real backend logic: place an order against limited inventory
 
 Run with: uvicorn gateway.app:app --host 0.0.0.0 --port 8000
 """
-import time
-import random
 import asyncio
-import redis
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -23,18 +20,14 @@ from fastapi.responses import JSONResponse
 # directly inside an `async def` FastAPI endpoint blocks uvicorn's entire
 # event loop for the duration of the call -- meaning concurrent requests
 # were secretly being processed ONE AT A TIME instead of concurrently.
-# Measured impact: 1000 requests that should take ~1-2s concurrently took
-# 49.78s, with p50 latency of 4.7s for what is actually <50ms of real work.
 # Fix: run every blocking call via asyncio.to_thread(), which hands it to
 # a worker thread and frees the event loop to handle other requests while
-# waiting. The "real" fix would be async libraries (redis.asyncio, asyncpg)
-# but to_thread() is the pragmatic fix that doesn't require rewriting the
-# rate limiter / idempotency modules.
+# waiting.
 
 from gateway import config
-from gateway.rate_limiter import SlidingWindowRateLimiter
 from gateway.idempotency import IdempotencyStore
-from gateway.consistent_hash import ConsistentHashRing
+from gateway.redis_shard_router import ShardedRateLimiter
+from gateway.orders import OrdersService
 
 app = FastAPI(title="Distributed API Gateway")
 
@@ -42,29 +35,22 @@ app = FastAPI(title="Distributed API Gateway")
 @app.on_event("startup")
 async def _size_up_thread_pool():
     # WHY: asyncio.to_thread() uses Python's default executor, capped at
-    # min(32, cpu_count + 4) threads out of the box. Each request makes up
-    # to 4 sequential blocking calls (rate limit check, idempotency begin,
-    # backend work, idempotency complete) -- with 100 concurrent requests
-    # all competing for a handful of default threads, we still bottleneck
-    # even after moving work off the event loop. Sizing this up removes
-    # that ceiling; the real limit becomes Postgres pool size / Redis
-    # connections, which is the actual resource we care about tuning.
+    # min(32, cpu_count + 4) threads out of the box. Sizing this up removes
+    # that ceiling; the real limit becomes Postgres/Redis pool sizes, which
+    # is the resource we actually want to be tuning.
     from concurrent.futures import ThreadPoolExecutor
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=128))
 
-redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
-rate_limiter = SlidingWindowRateLimiter(
-    redis_client, limit=config.RATE_LIMIT, window_seconds=config.RATE_LIMIT_WINDOW_SECONDS
+
+sharded_rate_limiter = ShardedRateLimiter(
+    shard_names=config.REDIS_SHARDS,
+    port=config.REDIS_PORT,
+    limit=config.RATE_LIMIT,
+    window_seconds=config.RATE_LIMIT_WINDOW_SECONDS,
 )
 idempotency_store = IdempotencyStore(config.POSTGRES_DSN)
-hash_ring = ConsistentHashRing(nodes=config.BACKEND_NODES)
-
-
-def simulate_backend_work(client_id: str) -> dict:
-    """Stand-in for a real backend call (e.g. 'create order', 'charge card')."""
-    time.sleep(random.uniform(0.01, 0.05))
-    return {"status": "processed", "client_id": client_id, "handled_by_node": config.NODE_ID}
+orders_service = OrdersService(config.POSTGRES_DSN)
 
 
 @app.get("/health")
@@ -72,21 +58,29 @@ def health():
     return {"status": "ok", "node": config.NODE_ID}
 
 
-@app.post("/api/action")
-async def api_action(request: Request):
+@app.get("/api/inventory")
+async def get_inventory():
+    snapshot = await asyncio.to_thread(orders_service.get_inventory_snapshot)
+    return {"inventory": snapshot, "handled_by": config.NODE_ID}
+
+
+@app.post("/api/orders")
+async def place_order(request: Request):
     client_id = request.headers.get("X-Client-Id")
     idempotency_key = request.headers.get("Idempotency-Key")
 
     if not client_id:
         raise HTTPException(400, "Missing X-Client-Id header")
 
-    owning_shard = hash_ring.get_node(client_id)
+    body = await request.json() if await request.body() else {}
+    product_id = body.get("product_id", "widget-a")
+    quantity = int(body.get("quantity", 1))
 
-    allowed, meta = await asyncio.to_thread(rate_limiter.allow, client_id)
+    allowed, meta, shard = await asyncio.to_thread(sharded_rate_limiter.allow, client_id)
     headers = {
         "X-RateLimit-Limit": str(meta["limit"]),
         "X-RateLimit-Remaining": str(meta["remaining"]),
-        "X-Owning-Shard": owning_shard,
+        "X-Redis-Shard": shard,
         "X-Handled-By": config.NODE_ID,
     }
 
@@ -115,12 +109,14 @@ async def api_action(request: Request):
                 headers=headers,
             )
 
-        # state == "new" -> actually do the work
-        result = await asyncio.to_thread(simulate_backend_work, client_id)
-        await asyncio.to_thread(idempotency_store.complete, idempotency_key, result, 200)
-        return JSONResponse(status_code=200, content=result, headers=headers)
+        # state == "new" -> actually place the order
+        result = await asyncio.to_thread(orders_service.place_order, client_id, product_id, quantity)
+        status_code = 200 if result["status"] == "confirmed" else 409
+        await asyncio.to_thread(idempotency_store.complete, idempotency_key, result, status_code)
+        return JSONResponse(status_code=status_code, content=result, headers=headers)
 
-    # no idempotency key provided -- process directly (not recommended for
-    # mutating endpoints in production, but allowed here for demo/testing)
-    result = await asyncio.to_thread(simulate_backend_work, client_id)
-    return JSONResponse(status_code=200, content=result, headers=headers)
+    # no idempotency key -- process directly (not recommended for mutating
+    # endpoints in production, but allowed here for demo/testing)
+    result = await asyncio.to_thread(orders_service.place_order, client_id, product_id, quantity)
+    status_code = 200 if result["status"] == "confirmed" else 409
+    return JSONResponse(status_code=status_code, content=result, headers=headers)

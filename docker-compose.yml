@@ -1,10 +1,20 @@
-version: "3.9"
-
 services:
-  redis:
+  redis-shard-1:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  redis-shard-2:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  redis-shard-3:
+    image: redis:7-alpine
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -31,48 +41,45 @@ services:
       - "8001:8000"  # diagnostic: hit gateway-1 directly, bypassing the LB
     environment:
       NODE_ID: gateway-1
-      REDIS_HOST: redis
+      REDIS_SHARDS: "redis-shard-1,redis-shard-2,redis-shard-3"
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       RATE_LIMIT: "10"
       RATE_LIMIT_WINDOW_SECONDS: "60"
-      BACKEND_NODES: "gateway-1,gateway-2,gateway-3"
     depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      redis-shard-1: { condition: service_healthy }
+      redis-shard-2: { condition: service_healthy }
+      redis-shard-3: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     command: uvicorn gateway.app:app --host 0.0.0.0 --port 8000
 
   gateway-2:
     build: .
     environment:
       NODE_ID: gateway-2
-      REDIS_HOST: redis
+      REDIS_SHARDS: "redis-shard-1,redis-shard-2,redis-shard-3"
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       RATE_LIMIT: "10"
       RATE_LIMIT_WINDOW_SECONDS: "60"
-      BACKEND_NODES: "gateway-1,gateway-2,gateway-3"
     depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      redis-shard-1: { condition: service_healthy }
+      redis-shard-2: { condition: service_healthy }
+      redis-shard-3: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     command: uvicorn gateway.app:app --host 0.0.0.0 --port 8000
 
   gateway-3:
     build: .
     environment:
       NODE_ID: gateway-3
-      REDIS_HOST: redis
+      REDIS_SHARDS: "redis-shard-1,redis-shard-2,redis-shard-3"
       POSTGRES_DSN: postgresql://gateway:gateway@postgres:5432/gateway
       RATE_LIMIT: "10"
       RATE_LIMIT_WINDOW_SECONDS: "60"
-      BACKEND_NODES: "gateway-1,gateway-2,gateway-3"
     depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
+      redis-shard-1: { condition: service_healthy }
+      redis-shard-2: { condition: service_healthy }
+      redis-shard-3: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     command: uvicorn gateway.app:app --host 0.0.0.0 --port 8000
 
   loadbalancer:
