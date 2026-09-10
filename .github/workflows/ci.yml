@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (syntax errors and undefined names)
+        run: ruff check --select E9,F63,F7,F82 .
+      - name: Pytest
+        run: python -m pytest tests/ -v
+
+  compose-e2e:
+    name: Docker Compose end-to-end + load test
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start stack
+        run: docker compose up -d --build --wait
+      - name: Smoke test
+        run: scripts/smoke_test.sh http://localhost:8080
+      - name: Load test (inside the Docker network)
+        run: |
+          docker compose exec -T loadbalancer python3 loadtest/loadtest.py | tee loadtest.txt
+          {
+            echo '## Load test results'
+            echo '```'
+            sed -n '/LOAD TEST RESULTS/,/====/p' loadtest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  k8s-e2e:
+    name: Kubernetes (kind) deploy + smoke test
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: gateway
+      - name: Build image and load into kind
+        run: |
+          docker build -t rate-limiting-gateway:local .
+          kind load docker-image rate-limiting-gateway:local --name gateway
+      - name: Deploy
+        run: |
+          kubectl apply -k k8s/
+          kubectl -n rate-limiter rollout status statefulset/postgres --timeout=180s
+          kubectl -n rate-limiter rollout status statefulset/redis --timeout=180s
+          kubectl -n rate-limiter rollout status statefulset/gateway --timeout=300s
+          kubectl -n rate-limiter rollout status deployment/loadbalancer --timeout=180s
+      - name: Smoke test through port-forward
+        run: |
+          kubectl -n rate-limiter port-forward svc/loadbalancer 8080:8080 >/tmp/pf.log 2>&1 &
+          sleep 5
+          scripts/smoke_test.sh http://localhost:8080
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl -n rate-limiter get pods -o wide
+          kubectl -n rate-limiter describe pods
+          kubectl -n rate-limiter logs -l app=gateway --tail=100 --prefix
+          kubectl -n rate-limiter logs -l app=loadbalancer --tail=100
+
+  publish-image:
+    name: Publish image to GHCR
+    runs-on: ubuntu-latest
+    needs: [compose-e2e, k8s-e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/rate-limiting-gateway:latest
+            ghcr.io/${{ github.repository_owner }}/rate-limiting-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

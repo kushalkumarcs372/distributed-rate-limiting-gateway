@@ -1,0 +1,48 @@
+# Single replica on purpose: connection counts and circuit-breaker state live
+# in this process's memory. Running two replicas would give each its own
+# inconsistent view of backend health (see README "Known limitations").
+apiVersion: v1
+kind: Service
+metadata:
+  name: loadbalancer
+spec:
+  selector:
+    app: loadbalancer
+  ports:
+    - name: http
+      port: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadbalancer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loadbalancer
+  template:
+    metadata:
+      labels:
+        app: loadbalancer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /lb/metrics
+    spec:
+      containers:
+        - name: loadbalancer
+          image: rate-limiting-gateway:local
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "loadbalancer.lb:app", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BACKEND_URLS
+              value: "http://gateway-0.gateway:8000,http://gateway-1.gateway:8000,http://gateway-2.gateway:8000"
+          readinessProbe:
+            httpGet: { path: /lb/status, port: 8080 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

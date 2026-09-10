@@ -1,0 +1,75 @@
+# Gateway nodes run as a StatefulSet so each pod has a stable identity
+# (gateway-0, gateway-1, gateway-2) that the custom load balancer can target
+# individually -- it needs per-backend connection counts and circuit state,
+# which a single ClusterIP Service would hide from it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+spec:
+  clusterIP: None
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 8000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gateway
+spec:
+  serviceName: gateway
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      initContainers:
+        # Don't start until Postgres accepts connections (the gateway
+        # creates its tables on startup).
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h postgres -U gateway; do sleep 2; done"]
+      containers:
+        - name: gateway
+          image: rate-limiting-gateway:local
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_SHARDS
+              value: "redis-0.redis,redis-1.redis,redis-2.redis"
+            - name: RATE_LIMIT
+              value: "10"
+            - name: RATE_LIMIT_WINDOW_SECONDS
+              value: "60"
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DSN
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }

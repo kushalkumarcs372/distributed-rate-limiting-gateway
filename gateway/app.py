@@ -12,8 +12,10 @@ Every incoming request goes through, in order:
 Run with: uvicorn gateway.app:app --host 0.0.0.0 --port 8000
 """
 import asyncio
+import time
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 # BUG FOUND UNDER LOAD TEST (worth knowing for interviews):
 # redis-py (sync client) and psycopg2 are BLOCKING libraries. Calling them
@@ -28,8 +30,29 @@ from gateway import config
 from gateway.idempotency import IdempotencyStore
 from gateway.redis_shard_router import ShardedRateLimiter
 from gateway.orders import OrdersService
+from gateway.metrics import REQUESTS, LATENCY, RATE_LIMIT_DECISIONS, IDEMPOTENCY_OUTCOMES
 
 app = FastAPI(title="Distributed API Gateway")
+
+
+@app.middleware("http")
+async def prometheus_middleware(request: Request, call_next):
+    if request.url.path == "/metrics":
+        return await call_next(request)
+    start = time.perf_counter()
+    response = await call_next(request)
+    # Label by route TEMPLATE (e.g. /api/orders), not raw path, so arbitrary
+    # URLs can't blow up the number of time series (label cardinality).
+    route = request.scope.get("route")
+    route_label = getattr(route, "path", "unmatched")
+    REQUESTS.labels(request.method, route_label, str(response.status_code)).inc()
+    LATENCY.labels(request.method, route_label).observe(time.perf_counter() - start)
+    return response
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.on_event("startup")
@@ -77,6 +100,7 @@ async def place_order(request: Request):
     quantity = int(body.get("quantity", 1))
 
     allowed, meta, shard = await asyncio.to_thread(sharded_rate_limiter.allow, client_id)
+    RATE_LIMIT_DECISIONS.labels(shard, "allowed" if allowed else "blocked").inc()
     headers = {
         "X-RateLimit-Limit": str(meta["limit"]),
         "X-RateLimit-Remaining": str(meta["remaining"]),
@@ -93,6 +117,7 @@ async def place_order(request: Request):
 
     if idempotency_key:
         state = await asyncio.to_thread(idempotency_store.try_begin, idempotency_key)
+        IDEMPOTENCY_OUTCOMES.labels({"completed": "replay"}.get(state, state)).inc()
 
         if state == "completed":
             stored = await asyncio.to_thread(idempotency_store.get_stored_response, idempotency_key)

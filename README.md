@@ -1,5 +1,7 @@
 # Distributed API Gateway with Adaptive Rate Limiting
 
+[![CI](https://github.com/kushalkumarcs372/distributed-rate-limiting-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/kushalkumarcs372/distributed-rate-limiting-gateway/actions/workflows/ci.yml)
+
 A multi-node API gateway demonstrating core distributed systems primitives:
 consistent hashing, sliding-window rate limiting, idempotent request handling,
 and a custom weighted least-connections load balancer.
@@ -237,6 +239,68 @@ noted in the extensions section below.
 This is worth stating explicitly in an interview: it demonstrates you can
 diagnose a real concurrency bug from load-test numbers, not just recite
 "use async" as a slogan.
+
+## Atomic rate limiting (race condition fix)
+
+The first limiter read both window counters, decided in Python, then
+incremented in a second round trip. Under concurrency that is a
+check-then-act race: several requests (from different gateway nodes or
+threads) can read the same count before any of them increments, so more
+than `limit` requests get through.
+
+The check and the increment now run as a single **Redis Lua script**,
+which Redis executes atomically. `tests/test_rate_limiter_atomic.py`
+releases 50 threads at the same instant against one client with a limit
+of 10 and asserts that exactly 10 are allowed.
+
+## Observability (Prometheus + Grafana)
+
+`docker compose up --build` now also starts Prometheus and Grafana.
+
+| URL | What |
+|---|---|
+| http://localhost:9090 | Prometheus (scrapes every gateway's `/metrics` and the LB's `/lb/metrics` every 5s) |
+| http://localhost:3000 | Grafana, pre-provisioned "Rate-Limiting Gateway" dashboard (anonymous view) |
+
+Metrics exported:
+
+- `gateway_requests_total{method,route,status}` and `gateway_request_duration_seconds` (histogram, drives p50/p95/p99 panels)
+- `gateway_rate_limit_decisions_total{shard,decision}`: allowed vs. blocked per Redis shard
+- `gateway_idempotency_outcomes_total{outcome}`: new / replay / in_progress
+- `lb_backend_circuit_state`, `lb_backend_active_connections`, `lb_backend_healthy`, `lb_proxied_requests_total`
+
+Routes are labelled by template (`/api/orders`), not raw path, to keep
+label cardinality bounded.
+
+## Kubernetes
+
+Manifests live in `k8s/` (Kustomize):
+
+- **Redis**: StatefulSet of 3 independent instances behind a headless Service, so each shard has a stable DNS name (`redis-0.redis`, ...) that the consistent hash ring routes to.
+- **Gateway**: StatefulSet of 3 with stable pod names, readiness/liveness probes on `/health`, resource limits, and an init container that waits for Postgres.
+- **Load balancer**: single-replica Deployment. It is deliberately one replica because circuit-breaker state lives in memory (see Known limitations).
+- **Postgres**: StatefulSet with a PersistentVolumeClaim; credentials in a Secret.
+
+Run locally with [kind](https://kind.sigs.k8s.io/):
+
+```bash
+kind create cluster --name gateway
+docker build -t rate-limiting-gateway:local .
+kind load docker-image rate-limiting-gateway:local --name gateway
+kubectl apply -k k8s/
+kubectl -n rate-limiter rollout status statefulset/gateway
+kubectl -n rate-limiter port-forward svc/loadbalancer 8080:8080
+scripts/smoke_test.sh
+```
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR:
+
+1. **Unit tests**: pytest, including the concurrency test for the atomic limiter.
+2. **Compose end-to-end**: builds and starts the full stack, runs `scripts/smoke_test.sh` (rate limiting, idempotent replay, metrics), then runs the load test inside the Docker network and posts the throughput/latency numbers to the job summary.
+3. **Kubernetes end-to-end**: creates a kind cluster, deploys `k8s/`, waits for every rollout, and runs the same smoke test through a port-forward.
+4. **Publish**: on `main`, pushes the image to `ghcr.io/kushalkumarcs372/rate-limiting-gateway`.
 
 ## Known limitations 
 - Load balancer is itself not distributed/HA (single instance) — see the Raft discussion above for why this is a deliberate, explained gap rather than a rushed fix

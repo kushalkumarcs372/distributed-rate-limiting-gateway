@@ -9,5 +9,9 @@ COPY gateway/ ./gateway/
 COPY loadbalancer/ ./loadbalancer/
 COPY loadtest/ ./loadtest/
 
-# Entrypoint is overridden per-service in docker-compose.yml
+# Run as an unprivileged user instead of root
+RUN useradd --create-home --uid 10001 app
+USER app
+
+# Entrypoint is overridden per-service in docker-compose.yml / k8s manifests
 CMD ["uvicorn", "gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]

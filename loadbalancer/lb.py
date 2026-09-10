@@ -33,6 +33,7 @@ import time
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, HTMLResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, generate_latest
 
 app = FastAPI(title="Load Balancer")
 
@@ -90,11 +91,22 @@ class Backend:
             self.opened_at = time.time()
 
 
-BACKENDS = [
-    Backend("http://gateway-1:8000", weight=1),
-    Backend("http://gateway-2:8000", weight=1),
-    Backend("http://gateway-3:8000", weight=1),
-]
+# Backends come from the environment so the same image works under Docker
+# Compose (gateway-1..3) and Kubernetes (StatefulSet pod DNS names).
+# Format: comma-separated URLs, optional weight suffix, e.g.
+#   BACKEND_URLS="http://gateway-1:8000,http://gateway-2:8000@2"
+_DEFAULT_BACKENDS = "http://gateway-1:8000,http://gateway-2:8000,http://gateway-3:8000"
+
+
+def _parse_backends(spec: str) -> list[Backend]:
+    backends = []
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        url, _, weight = entry.partition("@")
+        backends.append(Backend(url, weight=int(weight) if weight else 1))
+    return backends
+
+
+BACKENDS = _parse_backends(os.getenv("BACKEND_URLS", _DEFAULT_BACKENDS))
 
 _lock = asyncio.Lock()
 
@@ -115,7 +127,15 @@ async def pick_backend() -> Backend | None:
         return chosen
 
 
+PROXIED = Counter("lb_proxied_requests_total", "Requests proxied per backend", ["backend", "outcome"])
+BACKEND_ACTIVE = Gauge("lb_backend_active_connections", "In-flight requests per backend", ["backend"])
+BACKEND_HEALTHY = Gauge("lb_backend_healthy", "1 if the passive health check passes", ["backend"])
+BACKEND_CIRCUIT = Gauge("lb_backend_circuit_state", "0=CLOSED, 1=HALF_OPEN, 2=OPEN", ["backend"])
+_CIRCUIT_CODES = {"CLOSED": 0, "HALF_OPEN": 1, "OPEN": 2}
+
+
 async def release_backend(backend: Backend, success: bool):
+    PROXIED.labels(backend.url, "success" if success else "failure").inc()
     async with _lock:
         backend.active_connections = max(0, backend.active_connections - 1)
         backend.total_requests += 1
@@ -189,6 +209,18 @@ async def root():
     return HTMLResponse(
         '<meta http-equiv="refresh" content="0; url=/dashboard">'
     )
+
+
+@app.get("/lb/metrics")
+async def lb_metrics():
+    # Gauges are refreshed at scrape time from the live Backend objects.
+    # Served under /lb/ so it can't collide with the catch-all proxy route
+    # below, which would otherwise forward /metrics to a gateway node.
+    for b in BACKENDS:
+        BACKEND_ACTIVE.labels(b.url).set(b.active_connections)
+        BACKEND_HEALTHY.labels(b.url).set(1 if b.healthy else 0)
+        BACKEND_CIRCUIT.labels(b.url).set(_CIRCUIT_CODES.get(b.circuit_state, 0))
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

@@ -1,6 +1,6 @@
 """
-Sliding Window Counter Rate Limiter (Redis-backed)
----------------------------------------------------
+Sliding Window Counter Rate Limiter (Redis-backed, atomic)
+----------------------------------------------------------
 WHY NOT FIXED WINDOW:
 Fixed window (e.g. "100 req per minute, reset at :00") allows a burst of
 2x the limit right at the window boundary (100 requests at 11:59:59 +
@@ -18,9 +18,34 @@ window's count by how much of it still overlaps the sliding window.
     estimated_count = current_window_count +
                        previous_window_count * overlap_fraction
 
-This is the same algorithm Cloudflare and Kong use in production.
+WHY A LUA SCRIPT (race condition fix):
+The first version did GET/GET in one round trip, decided in Python, then
+INCR in a second round trip. Between those two round trips, other gateway
+nodes (or other threads on this node) could read the same counts and ALL
+decide "allowed" -- a classic check-then-act race that lets concurrent
+requests slip past the limit. Redis runs a Lua script atomically (no other
+command interleaves while it executes), so read + decide + increment now
+happen as one indivisible step. See tests/test_rate_limiter_atomic.py.
 """
 import time
+
+# KEYS[1] = current window key, KEYS[2] = previous window key
+# ARGV[1] = limit, ARGV[2] = overlap fraction of previous window, ARGV[3] = TTL seconds
+# Returns {allowed (1/0), estimated count as a string}. The estimate is returned
+# as a string because Redis truncates Lua numbers to integers in replies.
+_SLIDING_WINDOW_LUA = """
+local curr = tonumber(redis.call('GET', KEYS[1]) or '0')
+local prev = tonumber(redis.call('GET', KEYS[2]) or '0')
+local limit = tonumber(ARGV[1])
+local overlap = tonumber(ARGV[2])
+local estimated = curr + prev * overlap
+if estimated < limit then
+    redis.call('INCR', KEYS[1])
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+    return {1, tostring(estimated)}
+end
+return {0, tostring(estimated)}
+"""
 
 
 class SlidingWindowRateLimiter:
@@ -28,6 +53,9 @@ class SlidingWindowRateLimiter:
         self.redis = redis_client
         self.limit = limit
         self.window = window_seconds
+        # register_script caches the script by SHA and uses EVALSHA,
+        # falling back to EVAL automatically if Redis doesn't have it yet.
+        self._script = self.redis.register_script(_SLIDING_WINDOW_LUA)
 
     def _keys(self, client_id: str, now: float):
         current_bucket = int(now // self.window)
@@ -46,29 +74,19 @@ class SlidingWindowRateLimiter:
         now = time.time()
         curr_key, prev_key, curr_bucket = self._keys(client_id, now)
 
-        pipe = self.redis.pipeline()
-        pipe.get(curr_key)
-        pipe.get(prev_key)
-        curr_count, prev_count = pipe.execute()
-
-        curr_count = int(curr_count or 0)
-        prev_count = int(prev_count or 0)
-
         elapsed_in_current = now - (curr_bucket * self.window)
         overlap_fraction = max(0.0, (self.window - elapsed_in_current) / self.window)
 
-        estimated = curr_count + prev_count * overlap_fraction
-
-        allowed = estimated < self.limit
-        if allowed:
-            pipe = self.redis.pipeline()
-            pipe.incr(curr_key)
-            pipe.expire(curr_key, self.window * 2)  # keep around for next window's calc
-            pipe.execute()
+        allowed_flag, estimated_raw = self._script(
+            keys=[curr_key, prev_key],
+            args=[self.limit, overlap_fraction, self.window * 2],
+        )
+        allowed = int(allowed_flag) == 1
+        estimated = float(estimated_raw)
 
         return allowed, {
             "estimated_count": round(estimated, 2),
             "limit": self.limit,
-            "remaining": max(0, int(self.limit - estimated)),
+            "remaining": max(0, int(self.limit - estimated - (1 if allowed else 0))),
             "window_seconds": self.window,
         }
